@@ -1,27 +1,14 @@
 """
-ORM Models — User and GameSession tables.
+Document Models — MongoDB document schemas for User and GameSession.
 """
 
 from __future__ import annotations
 
 import enum
-import uuid
 from datetime import datetime, timezone
+from typing import Any
 
-from sqlalchemy import (
-    BigInteger,
-    DateTime,
-    Enum as SAEnum,
-    Float,
-    ForeignKey,
-    Integer,
-    String,
-    text,
-)
-from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import Mapped, mapped_column, relationship
-
-from app.database import Base
+from bson import ObjectId
 
 
 # ── Enums ────────────────────────────────────────────────────────────────────
@@ -33,86 +20,50 @@ class SessionStatus(str, enum.Enum):
     CHEATING_DETECTED = "cheating_detected"
 
 
-# ── Users ────────────────────────────────────────────────────────────────────
+# ── Document Helpers ─────────────────────────────────────────────────────────
 
 
-class User(Base):
-    __tablename__ = "users"
-
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        primary_key=True,
-        default=uuid.uuid4,
-        server_default=text("gen_random_uuid()"),
-    )
-    username: Mapped[str] = mapped_column(
-        String(50), unique=True, index=True, nullable=False
-    )
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        default=lambda: datetime.now(timezone.utc),
-        server_default=text("now()"),
-    )
-    total_sessions: Mapped[int] = mapped_column(
-        Integer, default=0, server_default=text("0")
-    )
-    best_time_ms: Mapped[int] = mapped_column(
-        BigInteger, default=0, server_default=text("0")
-    )
-
-    # relationships
-    sessions: Mapped[list["GameSession"]] = relationship(
-        back_populates="user", cascade="all, delete-orphan"
-    )
-
-    def __repr__(self) -> str:
-        return f"<User {self.username} best={self.best_time_ms}ms>"
+def new_user_doc(
+    username: str,
+    email: str | None = None,
+    hashed_password: str | None = None,
+) -> dict[str, Any]:
+    """Create a new user document dict for MongoDB insertion."""
+    doc: dict[str, Any] = {
+        "username": username,
+        "created_at": datetime.now(timezone.utc),
+        "total_sessions": 0,
+        "best_time_ms": 0,
+    }
+    if email is not None:
+        doc["email"] = email
+    if hashed_password is not None:
+        doc["hashed_password"] = hashed_password
+    return doc
 
 
-# ── Game Sessions ────────────────────────────────────────────────────────────
+def new_game_session_doc(
+    user_id: str,
+    username: str,
+) -> dict[str, Any]:
+    """Create a new game session document dict for MongoDB insertion."""
+    return {
+        "user_id": user_id,
+        "username": username,
+        "started_at": datetime.now(timezone.utc),
+        "ended_at": None,
+        "duration_ms": 0,
+        "status": SessionStatus.ACTIVE.value,
+        "final_ear": None,
+        "total_frames": 0,
+    }
 
 
-class GameSession(Base):
-    __tablename__ = "game_sessions"
-
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        primary_key=True,
-        default=uuid.uuid4,
-        server_default=text("gen_random_uuid()"),
-    )
-    user_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("users.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    username: Mapped[str] = mapped_column(
-        String(50), nullable=False
-    )
-    started_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        default=lambda: datetime.now(timezone.utc),
-    )
-    ended_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
-    duration_ms: Mapped[int] = mapped_column(
-        BigInteger, default=0
-    )
-    status: Mapped[SessionStatus] = mapped_column(
-        SAEnum(SessionStatus, name="session_status", create_constraint=True),
-        default=SessionStatus.ACTIVE,
-    )
-    final_ear: Mapped[float | None] = mapped_column(
-        Float, nullable=True
-    )
-    total_frames: Mapped[int] = mapped_column(
-        Integer, default=0
-    )
-
-    # relationships
-    user: Mapped["User"] = relationship(back_populates="sessions")
-
-    def __repr__(self) -> str:
-        return f"<GameSession {self.id} user={self.username} status={self.status}>"
+def serialize_doc(doc: dict[str, Any]) -> dict[str, Any]:
+    """Convert MongoDB document for API response (ObjectId → str)."""
+    if doc is None:
+        return doc
+    result = dict(doc)
+    if "_id" in result:
+        result["id"] = str(result.pop("_id"))
+    return result

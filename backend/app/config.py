@@ -13,10 +13,14 @@ class Settings(BaseSettings):
     app_name: str = "The Global Staring Contest"
     debug: bool = False
 
-    # ── Database (Supabase PostgreSQL) ───────────────────────────────────────
-    database_url: str = Field(
-        default="postgresql+asyncpg://postgres:password@localhost:5432/noblink",
-        description="Async SQLAlchemy connection string for PostgreSQL",
+    # ── Database (MongoDB) ───────────────────────────────────────────────────
+    mongodb_url: str = Field(
+        default="mongodb://localhost:27017",
+        description="MongoDB connection string",
+    )
+    mongodb_db_name: str = Field(
+        default="noblink",
+        description="MongoDB database name",
     )
 
     # ── Redis ────────────────────────────────────────────────────────────────
@@ -49,6 +53,7 @@ class Settings(BaseSettings):
         "env_file": ".env",
         "env_file_encoding": "utf-8",
         "case_sensitive": False,
+        "extra": "ignore",
     }
 
 

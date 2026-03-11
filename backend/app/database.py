@@ -1,66 +1,55 @@
 """
-Database — async SQLAlchemy engine and session factory for Supabase PostgreSQL.
+Database — async MongoDB client via motor.
 """
 
 from __future__ import annotations
 
-from sqlalchemy.ext.asyncio import (
-    AsyncSession,
-    async_sessionmaker,
-    create_async_engine,
-)
-from sqlalchemy.orm import DeclarativeBase
+from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 
 from app.config import settings
 
-# ── Engine ───────────────────────────────────────────────────────────────────
+# ── Client ───────────────────────────────────────────────────────────────────
 
-engine = create_async_engine(
-    settings.database_url,
-    echo=settings.debug,
-    pool_size=20,
-    max_overflow=10,
-    pool_pre_ping=True,
-)
-
-# ── Session Factory ──────────────────────────────────────────────────────────
-
-async_session_factory = async_sessionmaker(
-    engine,
-    class_=AsyncSession,
-    expire_on_commit=False,
-)
+_client: AsyncIOMotorClient | None = None
+_db: AsyncIOMotorDatabase | None = None
 
 
-# ── Base Model ───────────────────────────────────────────────────────────────
-
-class Base(DeclarativeBase):
-    pass
-
-
-# ── Dependency ───────────────────────────────────────────────────────────────
-
-async def get_db() -> AsyncSession:  # type: ignore[misc]
-    """FastAPI dependency — yields an async DB session."""
-    async with async_session_factory() as session:
-        try:
-            yield session
-            await session.commit()
-        except Exception:
-            await session.rollback()
-            raise
-        finally:
-            await session.close()
+def get_db() -> AsyncIOMotorDatabase:
+    """Return the shared MongoDB database instance."""
+    if _db is None:
+        raise RuntimeError("Database not initialised — call init_db() first")
+    return _db
 
 
 # ── Lifecycle ────────────────────────────────────────────────────────────────
 
+
 async def init_db() -> None:
-    """Create all tables (idempotent)."""
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    """
+    Initialise the MongoDB connection and create indexes.
+
+    Called once at application startup.
+    """
+    global _client, _db
+
+    _client = AsyncIOMotorClient(settings.mongodb_url)
+    _db = _client[settings.mongodb_db_name]
+
+    # Create indexes (idempotent)
+    await _db.users.create_index("username", unique=True)
+    await _db.users.create_index(
+        "email",
+        unique=True,
+        partialFilterExpression={"email": {"$exists": True}},
+    )
+    await _db.game_sessions.create_index("user_id")
+    await _db.game_sessions.create_index("started_at")
 
 
 async def close_db() -> None:
-    """Dispose of the connection pool."""
-    await engine.dispose()
+    """Close the MongoDB connection."""
+    global _client, _db
+    if _client is not None:
+        _client.close()
+        _client = None
+        _db = None

@@ -12,18 +12,16 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-import uuid
 from datetime import datetime, timezone
 
+from bson import ObjectId
 from fastapi import WebSocket, WebSocketDisconnect
 from pydantic import ValidationError
-from sqlalchemy import select
 
 from app.anti_cheat import AntiCheatTracker
-from app.config import settings
-from app.database import async_session_factory
+from app.database import get_db
 from app.ml_engine import BlinkDetector
-from app.models import GameSession, SessionStatus, User
+from app.models import SessionStatus, new_game_session_doc, new_user_doc
 from app.schemas import (
     GameOverReason,
     WSCountdown,
@@ -100,32 +98,29 @@ async def handle_game_session(client_id: str, ws: WebSocket) -> None:
             )
             return
 
-        user_id = raw.get("user_id", str(uuid.uuid4()))
+        user_id = raw.get("user_id", "")
         username = raw.get("username", f"Player_{client_id[:6]}")
 
         # ── 2. Create DB session ─────────────────────────────────────────
-        async with async_session_factory() as db:
-            # Get or verify user exists
-            result = await db.execute(
-                select(User).where(User.id == uuid.UUID(user_id))
-            )
-            user = result.scalar_one_or_none()
-            if user is None:
-                # Auto-create user for seamless UX
-                user = User(id=uuid.UUID(user_id), username=username)
-                db.add(user)
-                await db.flush()
+        db = get_db()
 
-            game_session = GameSession(
-                user_id=user.id,
-                username=username,
-                status=SessionStatus.ACTIVE,
-                started_at=datetime.now(timezone.utc),
-            )
-            db.add(game_session)
-            await db.commit()
-            await db.refresh(game_session)
-            session_id = str(game_session.id)
+        # Get or verify user exists
+        user = None
+        if user_id and ObjectId.is_valid(user_id):
+            user = await db.users.find_one({"_id": ObjectId(user_id)})
+
+        if user is None:
+            # Auto-create user for seamless UX
+            user_doc = new_user_doc(username)
+            result = await db.users.insert_one(user_doc)
+            user_id = str(result.inserted_id)
+        else:
+            user_id = str(user["_id"])
+
+        # Create game session
+        session_doc = new_game_session_doc(user_id, username)
+        result = await db.game_sessions.insert_one(session_doc)
+        session_id = str(result.inserted_id)
 
         await ws.send_json(
             WSSessionReady(type="SESSION_READY", session_id=session_id).model_dump()
@@ -310,35 +305,35 @@ async def _persist_session(
     final_ear: float | None = None,
     total_frames: int = 0,
 ) -> None:
-    """Update the game session in PostgreSQL and submit to the leaderboard."""
+    """Update the game session in MongoDB and submit to the leaderboard."""
     try:
-        async with async_session_factory() as db:
-            result = await db.execute(
-                select(GameSession).where(
-                    GameSession.id == uuid.UUID(session_id)
-                )
-            )
-            session = result.scalar_one_or_none()
+        db = get_db()
 
-            if session:
-                session.ended_at = datetime.now(timezone.utc)
-                session.duration_ms = duration_ms
-                session.status = status
-                session.final_ear = final_ear
-                session.total_frames = total_frames
-                await db.commit()
+        # Update game session
+        await db.game_sessions.update_one(
+            {"_id": ObjectId(session_id)},
+            {
+                "$set": {
+                    "ended_at": datetime.now(timezone.utc),
+                    "duration_ms": duration_ms,
+                    "status": status.value,
+                    "final_ear": final_ear,
+                    "total_frames": total_frames,
+                }
+            },
+        )
 
-            # Update user stats
-            if user_id:
-                result = await db.execute(
-                    select(User).where(User.id == uuid.UUID(user_id))
+        # Update user stats
+        if user_id and ObjectId.is_valid(user_id):
+            user = await db.users.find_one({"_id": ObjectId(user_id)})
+            if user:
+                update_fields: dict = {"$inc": {"total_sessions": 1}}
+                if duration_ms > user.get("best_time_ms", 0):
+                    update_fields["$set"] = {"best_time_ms": duration_ms}
+                await db.users.update_one(
+                    {"_id": ObjectId(user_id)},
+                    update_fields,
                 )
-                user = result.scalar_one_or_none()
-                if user:
-                    user.total_sessions += 1
-                    if duration_ms > user.best_time_ms:
-                        user.best_time_ms = duration_ms
-                    await db.commit()
 
         # Submit to Redis leaderboard (only for legit sessions)
         if status == SessionStatus.COMPLETED and user_id and username:

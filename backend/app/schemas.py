@@ -4,7 +4,6 @@ Pydantic Schemas — request / response models for the REST and WebSocket APIs.
 
 from __future__ import annotations
 
-import uuid
 from datetime import datetime
 from enum import Enum
 
@@ -110,19 +109,29 @@ class UserCreate(BaseModel):
     username: str = Field(..., min_length=1, max_length=50)
 
 
+class UserRegister(BaseModel):
+    username: str = Field(..., min_length=1, max_length=50)
+    email: str = Field(..., min_length=3, max_length=100)
+    password: str = Field(..., min_length=4, max_length=100)
+
+
+class UserLogin(BaseModel):
+    email: str = Field(..., min_length=3, max_length=100)
+    password: str = Field(..., min_length=4, max_length=100)
+
+
 class UserResponse(BaseModel):
-    id: uuid.UUID
+    id: str
     username: str
+    email: str | None = None
     created_at: datetime
     total_sessions: int
     best_time_ms: int
 
-    model_config = {"from_attributes": True}
-
 
 class GameSessionResponse(BaseModel):
-    id: uuid.UUID
-    user_id: uuid.UUID
+    id: str
+    user_id: str
     username: str
     started_at: datetime
     ended_at: datetime | None
@@ -130,8 +139,6 @@ class GameSessionResponse(BaseModel):
     status: str
     final_ear: float | None
     total_frames: int
-
-    model_config = {"from_attributes": True}
 
 
 class LeaderboardEntry(BaseModel):

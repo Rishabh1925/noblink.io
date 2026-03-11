@@ -16,23 +16,24 @@ Endpoints:
 from __future__ import annotations
 
 import logging
-import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException, WebSocket
+import bcrypt
+from bson import ObjectId
+from fastapi import FastAPI, HTTPException, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.database import async_session_factory, close_db, get_db, init_db
+from app.database import close_db, get_db, init_db
 from app.leaderboard import close_redis, get_redis, get_top_100, get_user_rank
-from app.models import GameSession, User
+from app.models import new_user_doc, serialize_doc
 from app.schemas import (
     GameSessionResponse,
     HealthResponse,
     LeaderboardResponse,
     UserCreate,
+    UserLogin,
+    UserRegister,
     UserResponse,
     UserStatsResponse,
 )
@@ -52,18 +53,30 @@ async def lifespan(app: FastAPI):
     )
     logger.info("🚀 Starting %s", settings.app_name)
 
-    # Connect to databases
-    await init_db()
-    logger.info("✅ PostgreSQL connected")
+    # Connect to databases (graceful degradation if unavailable)
+    try:
+        await init_db()
+        logger.info("✅ MongoDB connected")
+    except Exception as e:
+        logger.warning("⚠️  MongoDB unavailable: %s — running in degraded mode", e)
 
-    await get_redis()
-    logger.info("✅ Redis connected")
+    try:
+        await get_redis()
+        logger.info("✅ Redis connected")
+    except Exception as e:
+        logger.warning("⚠️  Redis unavailable: %s — leaderboard will not work", e)
 
     yield
 
     # Shutdown
-    await close_redis()
-    await close_db()
+    try:
+        await close_redis()
+    except Exception:
+        pass
+    try:
+        await close_db()
+    except Exception:
+        pass
     logger.info("👋 Shutdown complete")
 
 
@@ -94,14 +107,14 @@ app.add_middleware(
 
 @app.get("/api/health", response_model=HealthResponse, tags=["System"])
 async def health_check():
-    """Health check — verifies PostgreSQL and Redis connectivity."""
+    """Health check — verifies MongoDB and Redis connectivity."""
     db_status = "unknown"
     redis_status = "unknown"
 
     # Check DB
     try:
-        async with async_session_factory() as session:
-            await session.execute(select(1))
+        db = get_db()
+        await db.command("ping")
         db_status = "connected"
     except Exception as e:
         db_status = f"error: {e}"
@@ -123,53 +136,96 @@ async def health_check():
 
 
 @app.post("/api/users", response_model=UserResponse, tags=["Users"])
-async def create_or_get_user(
-    payload: UserCreate,
-    db: AsyncSession = Depends(get_db),
-):
+async def create_or_get_user(payload: UserCreate):
     """
     Register a new user or return existing user by username.
 
     This is a get-or-create endpoint — the frontend can call it on every
     session start without worrying about duplicates.
     """
-    result = await db.execute(
-        select(User).where(User.username == payload.username)
-    )
-    user = result.scalar_one_or_none()
+    db = get_db()
+    user = await db.users.find_one({"username": payload.username})
 
     if user is None:
-        user = User(username=payload.username)
-        db.add(user)
-        await db.flush()
-        await db.refresh(user)
+        doc = new_user_doc(payload.username)
+        result = await db.users.insert_one(doc)
+        doc["_id"] = result.inserted_id
+        user = doc
 
-    return user
+    return serialize_doc(user)
+
+
+@app.post("/api/users/register", response_model=UserResponse, tags=["Users"])
+async def register_user(payload: UserRegister):
+    """Register a new user with email and password."""
+    db = get_db()
+
+    # Check if email already exists
+    existing = await db.users.find_one({"email": payload.email})
+    if existing:
+        raise HTTPException(status_code=409, detail="Email already registered")
+
+    # Check if username already exists
+    existing = await db.users.find_one({"username": payload.username})
+    if existing:
+        raise HTTPException(status_code=409, detail="Username already taken")
+
+    # Hash password and create user
+    hashed = bcrypt.hashpw(payload.password.encode("utf-8"), bcrypt.gensalt())
+    doc = new_user_doc(
+        username=payload.username,
+        email=payload.email,
+        hashed_password=hashed.decode("utf-8"),
+    )
+    result = await db.users.insert_one(doc)
+    doc["_id"] = result.inserted_id
+
+    return serialize_doc(doc)
+
+
+@app.post("/api/users/login", response_model=UserResponse, tags=["Users"])
+async def login_user(payload: UserLogin):
+    """Sign in with email and password."""
+    db = get_db()
+
+    user = await db.users.find_one({"email": payload.email})
+    if user is None:
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    stored_hash = user.get("hashed_password", "")
+    if not stored_hash or not bcrypt.checkpw(
+        payload.password.encode("utf-8"), stored_hash.encode("utf-8")
+    ):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    return serialize_doc(user)
 
 
 @app.get("/api/users/{user_id}/stats", response_model=UserStatsResponse, tags=["Users"])
-async def get_user_stats(
-    user_id: uuid.UUID,
-    db: AsyncSession = Depends(get_db),
-):
+async def get_user_stats(user_id: str):
     """Get a user's profile and recent session history."""
-    result = await db.execute(select(User).where(User.id == user_id))
-    user = result.scalar_one_or_none()
+    db = get_db()
 
+    if not ObjectId.is_valid(user_id):
+        raise HTTPException(status_code=400, detail="Invalid user ID")
+
+    user = await db.users.find_one({"_id": ObjectId(user_id)})
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
 
-    sessions_result = await db.execute(
-        select(GameSession)
-        .where(GameSession.user_id == user_id)
-        .order_by(GameSession.started_at.desc())
+    sessions_cursor = (
+        db.game_sessions
+        .find({"user_id": user_id})
+        .sort("started_at", -1)
         .limit(20)
     )
-    sessions = sessions_result.scalars().all()
+    sessions = await sessions_cursor.to_list(length=20)
 
     return UserStatsResponse(
-        user=UserResponse.model_validate(user),
-        recent_sessions=[GameSessionResponse.model_validate(s) for s in sessions],
+        user=UserResponse(**serialize_doc(user)),
+        recent_sessions=[
+            GameSessionResponse(**serialize_doc(s)) for s in sessions
+        ],
     )
 
 
@@ -184,26 +240,38 @@ async def leaderboard_top_100():
     The frontend should poll this endpoint periodically (e.g. every 5 seconds)
     to display the live global leaderboard.
     """
-    return await get_top_100()
+    try:
+        return await get_top_100()
+    except Exception:
+        from datetime import datetime as _dt, timezone as _tz
+        return LeaderboardResponse(
+            date=_dt.now(_tz.utc).strftime("%Y-%m-%d"),
+            entries=[],
+            total_players=0,
+        )
 
 
 @app.get("/api/leaderboard/{user_id}/rank", tags=["Leaderboard"])
-async def leaderboard_user_rank(
-    user_id: uuid.UUID,
-    db: AsyncSession = Depends(get_db),
-):
+async def leaderboard_user_rank(user_id: str):
     """Get a specific user's rank on today's leaderboard."""
-    result = await db.execute(select(User).where(User.id == user_id))
-    user = result.scalar_one_or_none()
+    db = get_db()
 
+    if not ObjectId.is_valid(user_id):
+        raise HTTPException(status_code=400, detail="Invalid user ID")
+
+    user = await db.users.find_one({"_id": ObjectId(user_id)})
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
 
-    rank = await get_user_rank(str(user_id), user.username)
+    rank = None
+    try:
+        rank = await get_user_rank(user_id, user["username"])
+    except Exception:
+        pass
 
     return {
-        "user_id": str(user_id),
-        "username": user.username,
+        "user_id": user_id,
+        "username": user["username"],
         "rank": rank,
         "message": "Ranked" if rank else "No score today",
     }

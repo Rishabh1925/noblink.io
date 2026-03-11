@@ -16,9 +16,9 @@ A real-time multiplayer staring contest game where players compete to hold their
      ┌──────────────┐   REST (poll)             │   │  Anti-Cheat   │  │
      │  Leaderboard │ ← ────────────────────── │   └──────────────┘  │
      │  (Frontend)  │                           │                      │
-     └──────────────┘                           │   ┌───────┐  ┌────┐ │
-                                                │   │ Redis │  │ PG │ │
-                                                │   └───────┘  └────┘ │
+     └──────────────┘                           │   ┌───────┐ ┌─────┐ │
+                                                │   │ Redis │ │Mongo│ │
+                                                │   └───────┘ └─────┘ │
                                                 └──────────────────────┘
 ```
 
@@ -30,8 +30,7 @@ A real-time multiplayer staring contest game where players compete to hold their
 | Blink Detection | Custom EAR algorithm on MediaPipe landmarks |
 | Real-time | WebSockets |
 | Leaderboard | Redis Sorted Sets |
-| Database | PostgreSQL via Supabase |
-| ORM | SQLAlchemy 2.0 (async) |
+| Database | MongoDB (motor async driver) |
 
 ## Quick Start
 
@@ -39,7 +38,7 @@ A real-time multiplayer staring contest game where players compete to hold their
 
 - **Python 3.11+**
 - **Redis** — `brew install redis && redis-server` (or [Upstash](https://upstash.com) free tier)
-- **Supabase** — Create a free project at [supabase.com](https://supabase.com)
+- **MongoDB** — `brew install mongodb-community` (or [MongoDB Atlas](https://www.mongodb.com/atlas) free tier)
 
 ### 2. Setup
 
@@ -55,14 +54,15 @@ pip install -r requirements.txt
 
 # Configure environment
 cp .env.example .env
-# Edit .env with your Supabase DATABASE_URL and Redis URL
+# Edit .env with your MongoDB URL and Redis URL
 ```
 
 ### 3. Environment Variables
 
 | Variable | Description | Default |
 |---|---|---|
-| `DATABASE_URL` | Supabase PostgreSQL connection string | `postgresql+asyncpg://...localhost` |
+| `MONGODB_URL` | MongoDB connection string | `mongodb://localhost:27017` |
+| `MONGODB_DB_NAME` | MongoDB database name | `noblink` |
 | `REDIS_URL` | Redis connection URL | `redis://localhost:6379` |
 | `EAR_THRESHOLD` | Eye Aspect Ratio blink threshold | `0.21` |
 | `EAR_CONSEC_FRAMES` | Consecutive low-EAR frames for blink | `2` |
@@ -131,7 +131,7 @@ Client                          Server
 ```json
 {
   "type": "START_GAME",
-  "user_id": "uuid-string",
+  "user_id": "mongo-objectid-string",
   "username": "PlayerName"
 }
 ```
@@ -204,8 +204,8 @@ backend/
 │   ├── anti_cheat.py           # Frame validation + cheat detection
 │   ├── websocket_manager.py    # WS session state machine
 │   ├── leaderboard.py          # Redis sorted set operations
-│   ├── database.py             # Async SQLAlchemy engine
-│   ├── models.py               # User + GameSession ORM models
+│   ├── database.py             # Async MongoDB client (motor)
+│   ├── models.py               # MongoDB document schemas
 │   └── schemas.py              # Pydantic request/response models
 ├── tests/
 │   ├── test_ml_engine.py       # EAR + blink detection tests

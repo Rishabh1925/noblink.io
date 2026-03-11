@@ -1,15 +1,16 @@
 """
 Integration test for the WebSocket game flow and REST endpoints.
 
-Uses FastAPI's TestClient with mocked Redis and SQLite in-memory DB
+Uses FastAPI's TestClient with mocked Redis and MongoDB
 so no external services are required.
 """
 
 import uuid
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import fakeredis.aioredis
 import pytest
+from bson import ObjectId
 from httpx import ASGITransport, AsyncClient
 
 from app import leaderboard
@@ -37,7 +38,7 @@ async def mock_redis(monkeypatch):
 @pytest.fixture(autouse=True)
 def mock_db(monkeypatch):
     """
-    Mock the database layer so we don't need a real PostgreSQL.
+    Mock the database layer so we don't need a real MongoDB.
     The WebSocket handler and REST endpoints that need DB will use mocks.
     """
     from app import database
@@ -95,6 +96,35 @@ def _closed_eye_landmarks() -> dict:
     }
 
 
+def _build_mock_db():
+    """Build a mock MongoDB database with users and game_sessions collections."""
+    mock_user_id = ObjectId()
+    mock_session_id = ObjectId()
+
+    mock_users = MagicMock()
+    mock_users.find_one = AsyncMock(return_value={
+        "_id": mock_user_id,
+        "username": "TestPlayer",
+        "best_time_ms": 0,
+        "total_sessions": 0,
+    })
+    mock_users.insert_one = AsyncMock()
+    mock_users.update_one = AsyncMock()
+
+    mock_sessions = MagicMock()
+    mock_insert_result = MagicMock()
+    mock_insert_result.inserted_id = mock_session_id
+    mock_sessions.insert_one = AsyncMock(return_value=mock_insert_result)
+    mock_sessions.update_one = AsyncMock()
+
+    mock_db_instance = MagicMock()
+    mock_db_instance.users = mock_users
+    mock_db_instance.game_sessions = mock_sessions
+    mock_db_instance.command = AsyncMock(return_value={"ok": 1})
+
+    return mock_db_instance, mock_user_id, mock_session_id
+
+
 # ── REST Endpoint Tests ─────────────────────────────────────────────────────
 
 
@@ -103,12 +133,16 @@ class TestHealthEndpoint:
     async def test_health_returns_200(self):
         from app.main import app
 
-        transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test") as client:
-            response = await client.get("/api/health")
-            assert response.status_code == 200
-            data = response.json()
-            assert "status" in data
+        mock_db_instance, _, _ = _build_mock_db()
+
+        # Patch get_db in the main module (where it was imported)
+        with patch("app.main.get_db", return_value=mock_db_instance):
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                response = await client.get("/api/health")
+                assert response.status_code == 200
+                data = response.json()
+                assert "status" in data
 
 
 class TestLeaderboardEndpoint:
@@ -155,43 +189,21 @@ class TestWebSocketFlow:
         5. Send open-eye frames
         6. Send closed-eye frames → receive GAME_OVER
         """
-        from unittest.mock import MagicMock
+        from app.main import app
+        from fastapi.testclient import TestClient
 
-        # Create a mock user and session for the DB layer
-        mock_user = MagicMock()
-        mock_user.id = uuid.uuid4()
-        mock_user.username = "TestPlayer"
-        mock_user.best_time_ms = 0
-        mock_user.total_sessions = 0
+        mock_db_instance, mock_user_id, _ = _build_mock_db()
 
-        mock_session = MagicMock()
-        mock_session.id = uuid.uuid4()
-
-        # Mock the async session factory
-        mock_db_session = AsyncMock()
-        mock_result = MagicMock()
-        mock_result.scalar_one_or_none.return_value = mock_user
-        mock_db_session.execute = AsyncMock(return_value=mock_result)
-        mock_db_session.add = MagicMock()
-        mock_db_session.flush = AsyncMock()
-        mock_db_session.refresh = AsyncMock(side_effect=lambda obj: setattr(obj, 'id', mock_session.id))
-        mock_db_session.commit = AsyncMock()
-        mock_db_session.close = AsyncMock()
-
-        # Create an async context manager mock
-        mock_context = AsyncMock()
-        mock_context.__aenter__ = AsyncMock(return_value=mock_db_session)
-        mock_context.__aexit__ = AsyncMock(return_value=False)
-
-        with patch("app.websocket_manager.async_session_factory", return_value=mock_context):
-            from app.main import app
-            from fastapi.testclient import TestClient
-
-            client = TestClient(app)
+        # Patch get_db in BOTH main and websocket_manager modules
+        with (
+            patch("app.main.get_db", return_value=mock_db_instance),
+            patch("app.websocket_manager.get_db", return_value=mock_db_instance),
+        ):
+            test_client = TestClient(app)
             client_id = str(uuid.uuid4())
-            user_id = str(mock_user.id)
+            user_id = str(mock_user_id)
 
-            with client.websocket_connect(f"/ws/staring-contest/{client_id}") as ws:
+            with test_client.websocket_connect(f"/ws/staring-contest/{client_id}") as ws:
                 # 1. START_GAME
                 ws.send_json({
                     "type": "START_GAME",

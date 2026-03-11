@@ -15,6 +15,7 @@ env/
 
 # Environment variables
 .env
+.env.local
 
 # IDE
 .vscode/
@@ -34,3 +35,9 @@ htmlcov/
 
 # Redis
 dump.rdb
+
+# Node
+node_modules/
+
+# Logs
+*.log
